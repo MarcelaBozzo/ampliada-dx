@@ -807,19 +807,23 @@ async function Host() {
   let session = (() => { try { return JSON.parse(sessionStorage.getItem('qdx-session-auth') || 'null'); } catch (e) { return null; } })();
   let remote = null, cloudState = 'idle', saveUIEl = null;
 
+  // devuelve el archivo cifrado, false si no existe, o null si no hay conexión
   async function cloudRead() {
     const ok = j => (j && j.app === 'juegos-en-vivo' && j.data ? j : false);
+    let net = false;
     if (repo) {
       try {
-        const h = { Accept: 'application/vnd.github.raw' };
-        if (cloud.token) h.Authorization = 'Bearer ' + cloud.token;
-        const r = await fetch(apiUrl(), { headers: h, cache: 'no-store' });
-        if (r.status === 404) return false;
+        const r = await fetch(apiUrl(), { headers: { Accept: 'application/vnd.github.raw' }, cache: 'no-store' });
+        net = true;
         if (r.ok) return ok(await r.json());
+        if (r.status === 404) return false;
       } catch (e) {}
     }
-    if (location.protocol === 'file:') return false;
-    try { const r = await fetch(CLOUD_FILE + '?t=' + Date.now(), { cache: 'no-store' }); return r.ok ? ok(await r.json()) : false; } catch (e) { return false; }
+    if (location.protocol === 'file:') return net ? false : null;
+    try {
+      const r = await fetch(CLOUD_FILE + '?t=' + Date.now(), { cache: 'no-store' });
+      return r.ok ? ok(await r.json()) : false;
+    } catch (e) { return net ? false : null; }
   }
   async function makeVerifier(user, secret, salt) {
     salt = salt || crypto.getRandomValues(new Uint8Array(16));
@@ -838,31 +842,22 @@ async function Host() {
     view = { name: 'home' }; render();
   }
 
-  async function doCreate(user, p1, p2, msg, btn) {
-    if (!normUser(user)) { msg.textContent = 'Escribe un usuario.'; return; }
-    if (p1.length < 8) { msg.textContent = 'La clave debe tener al menos 8 caracteres.'; return; }
-    if (p1 !== p2) { msg.textContent = 'Las claves no coinciden.'; return; }
-    btn.disabled = true; msg.textContent = '';
-    try {
-      const secret = secretOf(user, p1);
-      auth = await makeVerifier(user, secret); store.set('qdx-auth', auth);
-      setSession(user, secret); view = { name: 'home' }; render();
-      toast('Acceso creado. Cuando prepares tus rondas, toca 💾 Guardar para tenerlas en la nube.');
-    } finally { btn.disabled = false; }
-  }
   async function doLogin(user, pass, msg, btn) {
     if (!normUser(user) || !pass) { msg.textContent = 'Escribe tu usuario y tu clave.'; return; }
     const secret = secretOf(user, pass);
     btn.disabled = true; msg.textContent = 'Verificando…';
     try {
-      remote = await cloudRead() || remote;
+      const fresh = await cloudRead();
+      if (fresh !== null) remote = fresh;
       if (remote) {
         let payload;
         try { payload = await openData(remote, secret); } catch (e) { msg.textContent = 'Usuario o clave incorrectos.'; return; }
         auth = await makeVerifier(user, secret); store.set('qdx-auth', auth);
         if (payload.token) cloud.token = payload.token;
         const synced = cloud.savedAt || 0, rAt = remote.savedAt || 0;
-        let useRemote = rAt > synced;
+        // el archivo inicial (sin rondas) nunca reemplaza lo que ya preparaste en este equipo
+        let useRemote = !payload.seed && rAt > synced;
+        if (payload.seed && !cloud.savedAt) cloud.savedAt = 0;
         if (useRemote && hadLocal && data.updatedAt > synced) {
           useRemote = await modal(close => [
             el('p', { text: 'En la nube hay una versión más nueva, pero este equipo también tiene cambios sin guardar. ¿Cuál quieres usar?' }),
@@ -874,19 +869,21 @@ async function Host() {
           data = normalize(d); data.updatedAt = rAt; cloud.savedAt = rAt; await writeNow();
         }
         store.set('qdx-cloud', cloud);
-      } else if (auth) {
+      } else if (fresh === null && auth) {
+        // sin internet: se valida con la huella guardada en este equipo
         const v = await makeVerifier(user, secret, b64.dec(auth.salt));
         if (v.user !== auth.user || v.hash !== auth.hash) { msg.textContent = 'Usuario o clave incorrectos.'; return; }
-      } else { msg.textContent = 'Aún no hay un acceso creado. Recarga la página.'; return; }
+      } else if (fresh === null) { msg.textContent = 'No hay conexión con GitHub. Revisa tu internet e inténtalo de nuevo.'; return; }
+      else { msg.textContent = 'Este panel aún no está configurado: falta el archivo rondas.dat en el repositorio.'; return; }
       msg.textContent = '';
       setSession(user, secret); view = { name: 'home' }; render();
     } finally { btn.disabled = false; }
   }
 
-  function askToken() {
+  function askToken(problem) {
     return modal(close => {
       const tok = el('input', { type: 'password', class: 'pw', placeholder: 'Pega aquí el token (empieza con github_pat_)', 'aria-label': 'Token de GitHub', autocomplete: 'off' });
-      const err = el('p', { class: 'err', role: 'alert' });
+      const err = el('p', { class: 'err', role: 'alert', text: problem || '' });
       const ok = () => {
         const t = tok.value.trim();
         if (!/^(github_pat_|ghp_)\w{10,}/.test(t)) { err.textContent = 'Eso no parece un token de GitHub: debe empezar con github_pat_'; return; }
@@ -903,14 +900,15 @@ async function Host() {
           el('li', { text: `Repository access: "Only select repositories" → ${repo.repo}.` }),
           el('li', { text: 'Permissions: agrega "Contents" con acceso "Read and write".' }),
           el('li', { text: 'Toca "Generate token", cópialo y pégalo aquí abajo.' })),
+        el('p', { class: 'hint', text: 'En "Resource owner" debe aparecer tu cuenta personal (no una organización).' }),
         tok, err,
         el('div', { class: 'mact' }, el('button', { class: 'btn light', onclick: () => close(false) }, 'Cancelar'), el('button', { class: 'btn primary', onclick: ok }, 'Conectar y guardar'))];
     });
   }
-  async function cloudSave(silent) {
+  async function cloudSave(silent, problem) {
     if (!session) return false;
     if (!repo) { await writeNow(); toast('Guardado en este navegador. La nube funciona cuando abres el juego desde tu link de GitHub.'); return false; }
-    if (!cloud.token) { const t = await askToken(); if (!t) return false; cloud.token = t; store.set('qdx-cloud', cloud); }
+    if (!cloud.token || problem) { const t = await askToken(problem); if (!t) { cloudState = 'idle'; updateSaveUI(); return false; } cloud.token = t; store.set('qdx-cloud', cloud); }
     cloudState = 'saving'; updateSaveUI();
     await writeNow();
     try {
@@ -918,7 +916,7 @@ async function Host() {
       const put = async () => {
         let sha;
         const g = await fetch(apiUrl(), { headers: H, cache: 'no-store' });
-        if (g.status === 401) throw { auth: true };
+        if (g.status === 401 || g.status === 403) throw { auth: g.status };
         if (g.ok) sha = (await g.json()).sha; else if (g.status !== 404) throw new Error('GET ' + g.status);
         const at = Date.now();
         const file = await sealData({ data, token: cloud.token, user: session.user }, session.secret, at);
@@ -929,7 +927,7 @@ async function Host() {
       };
       let { res, file } = await put();
       if (res.status === 409 || res.status === 422) ({ res, file } = await put());
-      if (res.status === 401 || res.status === 403 || res.status === 404) throw { auth: true };
+      if (res.status === 401 || res.status === 403 || res.status === 404) throw { auth: res.status };
       if (!res.ok) throw new Error('PUT ' + res.status);
       remote = file; cloud.savedAt = file.savedAt; store.set('qdx-cloud', cloud);
       cloudState = 'idle'; updateSaveUI();
@@ -940,12 +938,24 @@ async function Host() {
       cloudState = 'idle'; updateSaveUI();
       if (e && e.auth) {
         cloud.token = null; store.set('qdx-cloud', cloud);
-        toast('GitHub no aceptó el permiso (token vencido o sin acceso al repositorio). Conéctalo de nuevo.');
-        return cloudSave(silent);
+        const why = e.auth === 401 ? 'GitHub dice que ese token no es válido o ya venció. Crea uno nuevo y pégalo.'
+          : e.auth === 403 ? 'El token no tiene permiso para escribir: en Permissions, "Contents" debe estar en "Read and write". Si el Resource owner es una organización, crea el token con tu cuenta personal.'
+          : `El token no tiene acceso al repositorio "${repo.repo}": en "Repository access" elige "Only select repositories" y márcalo.`;
+        return cloudSave(silent, why);
       }
-      toast('No se pudo guardar en la nube. Revisa tu internet e inténtalo otra vez. Tus cambios siguen guardados en este equipo.');
+      toast(e instanceof TypeError ? 'No se pudo conectar con GitHub. Revisa tu internet e inténtalo de nuevo.' : 'No se pudo guardar en la nube (' + (e && e.message || 'error') + '). Tus cambios siguen guardados en este equipo.');
       return false;
     }
+  }
+  async function changePassword() {
+    const pass = await askPassword('Nueva clave', 'Desde ahora entrarás con esta clave en todos los equipos. Anótala: si la olvidas no se puede recuperar.', true);
+    if (!pass) return;
+    if (pass.length < 8) { toast('La clave debe tener al menos 8 caracteres.'); return; }
+    const old = session;
+    setSession(session.user, secretOf(session.user, pass));
+    data.updatedAt = Date.now();
+    if (await cloudSave(true)) { auth = await makeVerifier(session.user, session.secret); store.set('qdx-auth', auth); toast('Clave cambiada ✓'); }
+    else { setSession(old.user, old.secret); toast('No se cambió la clave porque no se pudo guardar en la nube.'); }
   }
   const unsavedCloud = () => !cloud.savedAt || data.updatedAt > cloud.savedAt;
   function saveUI() { saveUIEl = el('div', { class: 'saveui' }); updateSaveUI(); return saveUIEl; }
@@ -971,25 +981,29 @@ async function Host() {
   }
 
   function renderLogin() {
-    const ev = data.event, create = !remote && !auth;
+    const ev = data.event, create = false, notReady = remote === false;
     const u = el('input', { type: 'text', class: 'pw', placeholder: 'Usuario', autocomplete: 'username', value: auth ? auth.user : '', 'aria-label': 'Usuario', autocapitalize: 'off' });
     const p1 = el('input', { type: 'password', class: 'pw', placeholder: create ? 'Crea una clave (mínimo 8 caracteres)' : 'Clave', autocomplete: create ? 'new-password' : 'current-password', 'aria-label': 'Clave' });
     const p2 = create ? el('input', { type: 'password', class: 'pw', placeholder: 'Repite la clave', autocomplete: 'new-password', 'aria-label': 'Repite la clave' }) : null;
     const msg = el('p', { class: 'err', role: 'alert' });
     const btn = el('button', { class: 'btn primary big', type: 'submit' }, create ? 'Crear acceso' : 'Entrar');
-    const form = el('form', { class: 'card login', onsubmit: e => { e.preventDefault(); create ? doCreate(u.value, p1.value, p2.value, msg, btn) : doLogin(u.value, p1.value, msg, btn); } },
+    const form = el('form', { class: 'card login', onsubmit: e => { e.preventDefault(); doLogin(u.value, p1.value, msg, btn); } },
       el('h2', { text: create ? 'Crea tu acceso' : 'Ingresa al panel' }),
       el('p', { class: 'hint', text: create
         ? 'Con este usuario y clave entrarás a preparar y lanzar los juegos desde cualquier equipo. Anótalos: si olvidas la clave no se puede recuperar.'
         : 'Solo quien tenga el usuario y la clave puede ver y editar las rondas.' }),
       u, p1, p2, msg, btn,
       create ? el('p', { class: 'hint', text: '¿Ya creaste tu acceso en otro equipo? Entra allá, toca 💾 Guardar y luego recarga esta página.' }) : null);
+    const box = notReady
+      ? el('div', { class: 'card login' }, el('h2', { text: 'Panel no disponible' }),
+          el('p', { class: 'hint', text: 'Este panel aún no está configurado. Si eres la organizadora, sube el archivo rondas.dat a tu repositorio de GitHub y recarga esta página.' }))
+      : form;
     mount(el('div', { class: 'topbar' }, brand(), el('div', { class: 'spacer' }), fsBtn()),
       el('div', { class: 'loginwrap' },
         el('div', null, evTitle(ev.title), evSub(ev.subtitle), ev.tagline ? el('div', { class: 'tagline', text: ev.tagline }) : null,
           el('p', { class: 'lead', style: { 'margin-top': '28px' }, text: 'Panel de juegos en vivo' })),
-        form));
-    setTimeout(() => (u.value ? p1 : u).focus(), 60);
+        box));
+    if (!notReady) setTimeout(() => (u.value ? p1 : u).focus(), 60);
   }
   function setSaved(s) {
     saveState = s;
@@ -1119,6 +1133,9 @@ async function Host() {
         el('div', { class: 'row' }, ev.logo ? el('img', { class: 'logoprev', src: ev.logo, alt: 'Logo actual' }) : null,
           el('button', { class: 'btn light sm', onclick: () => logoIn.click() }, ev.logo ? 'Cambiar logo' : 'Subir logo'),
           ev.logo ? el('button', { class: 'btn light sm', onclick: () => { ev.logo = null; persist(); render(); } }, 'Quitar') : null, logoIn)),
+      el('div', { class: 'field' }, el('label', { text: 'Tu acceso' }),
+        el('div', { class: 'row' }, el('span', { class: 'hint', style: { margin: '0' }, text: 'Usuario: ' + (session ? session.user : '') }),
+          el('button', { class: 'btn light sm', onclick: changePassword }, '🔑 Cambiar clave'))),
       el('div', { class: 'field' }, el('label', { text: 'Respaldo de tus rondas (incluye las fotos)' }),
         el('div', { class: 'row' }, el('button', { class: 'btn light sm', onclick: exportData }, '⬇ Exportar respaldo'),
           el('button', { class: 'btn light sm', onclick: () => imp.click() }, '⬆ Importar respaldo'), imp),
