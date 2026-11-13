@@ -439,16 +439,53 @@ const LETTERS = ['A', 'B', 'C', 'D'];
 const COLORS = ['#f26b1d', '#2f6fde', '#0e8f86', '#8a4fe0'];
 const READY_MS = 4600;
 const BOT_NAMES = ['Andrea', 'Benja', 'Coni', 'Diego', 'Eli', 'Feña', 'Gabi', 'Hugo', 'Isi', 'Javi', 'Kari', 'Lucho', 'Majo', 'Nico', 'Oli'];
-const PEER_OPTS = {
-  debug: 1,
-  config: { iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' }
-  ] }
-};
 const params = new URLSearchParams(location.search);
 const JOIN = params.get('j');
+const TURN_URL_PARAM = params.get('tk');   // respaldo opcional (enlace de credenciales de Metered)
+
+/* Servidores para conectar navegadores. Si la red (oficina, VPN, Wi-Fi corporativo) bloquea la
+   conexión directa, el tráfico pasa por un "puente" TURN en los puertos 80/443. */
+let peerOptsP = null, peerOptsAt = 0;
+const okTurnUrl = u => typeof u === 'string' && /^https:\/\/[a-z0-9-]+\.metered\.live\/api\/v1\/turn\/credentials\?apiKey=[\w-]+$/i.test(u.trim());
+function peerOpts(turnUrl) {
+  if (peerOptsP && Date.now() - peerOptsAt < 6 * 3600e3) return peerOptsP;
+  peerOptsAt = Date.now();
+  peerOptsP = (async () => {
+    const ice = [
+      { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+      { urls: 'stun:stun.cloudflare.com:3478' }
+    ];
+    try { // Open Relay (gratis): credencial temporal calculada con su clave pública
+      const username = String(Math.floor(Date.now() / 1000) + 48 * 3600);
+      const k = await crypto.subtle.importKey('raw', new TextEncoder().encode('openrelayprojectsecret'), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+      const credential = b64.enc(await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(username)));
+      ice.push({ urls: ['turn:staticauth.openrelay.metered.ca:80', 'turn:staticauth.openrelay.metered.ca:80?transport=tcp',
+        'turn:staticauth.openrelay.metered.ca:443', 'turns:staticauth.openrelay.metered.ca:443?transport=tcp'], username, credential });
+    } catch (e) {}
+    const extra = turnUrl || TURN_URL_PARAM;
+    if (okTurnUrl(extra)) {
+      try {
+        const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 5000);
+        const r = await fetch(extra.trim(), { signal: ctl.signal }); clearTimeout(to);
+        if (r.ok) { const arr = await r.json(); if (Array.isArray(arr)) ice.push(...arr.filter(x => x && x.urls)); }
+      } catch (e) {}
+    }
+    return { debug: 1, config: { iceServers: ice } };
+  })();
+  return peerOptsP;
+}
+/* Prueba de red: ¿se puede llegar al puente desde aquí? */
+async function testNetwork(turnUrl) {
+  const opts = await peerOpts(turnUrl);
+  const pc = new RTCPeerConnection(opts.config);
+  const found = new Set();
+  pc.onicecandidate = e => { if (e.candidate) { const m = / typ (\w+)/.exec(e.candidate.candidate); if (m) found.add(m[1]); } };
+  pc.createDataChannel('t');
+  await pc.setLocalDescription(await pc.createOffer());
+  await new Promise(res => { const end = () => res(); pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') end(); }; setTimeout(end, 8000); });
+  pc.close();
+  return { direct: found.has('srflx'), relay: found.has('relay') };
+}
 const app = document.getElementById('app');
 
 /* ------------------------------------------------------------------ utilidades */
@@ -1133,6 +1170,24 @@ async function Host() {
         el('div', { class: 'row' }, ev.logo ? el('img', { class: 'logoprev', src: ev.logo, alt: 'Logo actual' }) : null,
           el('button', { class: 'btn light sm', onclick: () => logoIn.click() }, ev.logo ? 'Cambiar logo' : 'Subir logo'),
           ev.logo ? el('button', { class: 'btn light sm', onclick: () => { ev.logo = null; persist(); render(); } }, 'Quitar') : null, logoIn)),
+      el('div', { class: 'field' }, el('label', { text: 'Conexión en redes de oficina' }),
+        el('p', { class: 'hint', style: { 'margin-top': '0' }, text: 'Si una red bloquea la conexión directa, el juego usa automáticamente un puente gratuito. Prueba la red donde harás la reunión:' }),
+        el('div', { class: 'row' }, el('button', { class: 'btn light sm', onclick: async e => {
+          const b = e.currentTarget; b.disabled = true; b.textContent = 'Probando… (8 s)';
+          try {
+            const r = await testNetwork(ev.turnUrl);
+            await modal(close => [
+              el('p', { text: r.relay ? '✅ Esta red funciona: el puente de respaldo está disponible.' : r.direct ? '⚠️ La conexión directa funciona, pero el puente no respondió.' : '❌ Esta red bloquea la conexión y el puente no respondió.' }),
+              el('p', { class: 'hint', text: r.relay ? 'Aunque el Wi-Fi bloquee conexiones directas, los celulares podrán unirse a través del puente.'
+                : r.direct ? 'En redes de casa o datos móviles funcionará. En redes muy restringidas podría fallar: agrega el respaldo de abajo.'
+                : 'Prueba con otra red (por ejemplo, datos móviles o compartir internet desde tu celular) o agrega el respaldo de abajo.' }),
+              el('div', { class: 'mact' }, el('button', { class: 'btn primary', onclick: () => close(true) }, 'Entendido'))]);
+          } catch (err) { toast('No se pudo hacer la prueba en este navegador.'); }
+          b.disabled = false; b.textContent = '📶 Probar la red de este equipo';
+        } }, '📶 Probar la red de este equipo')),
+        el('details', { style: { 'margin-top': '10px' } }, el('summary', { class: 'flabel', style: { cursor: 'pointer' }, text: 'Respaldo opcional (solo si la prueba falla)' }),
+          el('p', { class: 'hint', text: 'Crea una cuenta gratuita en metered.ca, ve a "TURN Server" y copia el enlace de credenciales (empieza con https:// y termina con ?apiKey=…). Pégalo aquí y guarda.' }),
+          el('input', { type: 'text', value: ev.turnUrl || '', placeholder: 'https://tu-app.metered.live/api/v1/turn/credentials?apiKey=…', oninput: e => { ev.turnUrl = e.target.value.trim(); peerOptsP = null; persist(); } }))),
       el('div', { class: 'field' }, el('label', { text: 'Tu acceso' }),
         el('div', { class: 'row' }, el('span', { class: 'hint', style: { margin: '0' }, text: 'Usuario: ' + (session ? session.user : '') }),
           el('button', { class: 'btn light sm', onclick: changePassword }, '🔑 Cambiar clave'))),
@@ -1319,15 +1374,20 @@ async function Host() {
       (resume.players || []).forEach(p => game.players.set(p.pid, { pid: p.pid, name: p.name, joinedAt: p.joinedAt, rs: p.rs || {}, conn: null, online: false, seen: 0, imgSent: new Set() }));
     }
     game.status = 'connecting'; view = { name: 'game' }; render();
+    peerOptsP = null;
     connectPeer(game, resume ? resume.code : null, 0);
   }
-  function connectPeer(g, fixed, attempt) {
+  async function connectPeer(g, fixed, attempt) {
     const code = fixed || rid(6);
-    const pr = new Peer(PREFIX + code, PEER_OPTS);
+    const opts = await peerOpts(data.event.turnUrl);
+    if (game !== g) return;
+    const pr = new Peer(PREFIX + code, opts);
     g.peer = pr;
     pr.on('open', () => {
       if (g.peer !== pr || game !== g) return;
-      g.code = code; g.joinUrl = location.origin + location.pathname + '?j=' + code; g.qrSvg = makeQR(g.joinUrl);
+      g.code = code;
+      g.joinUrl = location.origin + location.pathname + '?j=' + code + (okTurnUrl(data.event.turnUrl) ? '&tk=' + encodeURIComponent(data.event.turnUrl.trim()) : '');
+      g.qrSvg = makeQR(g.joinUrl);
       g.status = 'open'; saveSession(); wakeLock(); gameRender();
     });
     pr.on('connection', c => setupConn(g, c));
@@ -1848,12 +1908,14 @@ function Player() {
   function fail(msg) {
     if (kicked) return;
     cleanup(); fails++;
-    showBar((msg || 'Se perdió la conexión.') + ' Reintentando…');
+    showBar((msg || 'Se perdió la conexión.') + ' Reintentando…' + (fails >= 2 ? ' Si estás en el Wi-Fi de la oficina o con VPN, prueba con datos móviles.' : ''));
     clearTimeout(retryT); retryT = setTimeout(connect, Math.min(1500 + fails * 700, 7000));
   }
-  function connect() {
+  async function connect() {
     clearTimeout(retryT); cleanup();
-    const pr = new Peer(PEER_OPTS); peer = pr;
+    const opts = await peerOpts();
+    if (kicked) return;
+    const pr = new Peer(opts); peer = pr;
     pr.on('open', () => {
       if (peer !== pr) return;
       const c = pr.connect(hostId, { reliable: true }); conn = c;
