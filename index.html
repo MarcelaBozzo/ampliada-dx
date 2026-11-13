@@ -331,7 +331,10 @@ input[type=radio],input[type=checkbox]{accent-color:var(--ok);width:18px;height:
 .pcd.low{background:#ff4d5a}
 .pimg{background:rgba(255,255,255,.06);border-radius:16px;padding:6px;display:grid;place-items:center;min-height:120px}
 .pimg img{max-height:34vh;max-height:34dvh;width:auto;border-radius:12px;object-fit:contain;display:block}
-.pbtns{display:grid;gap:10px}
+.pbtns{display:grid;gap:10px;flex:1;grid-auto-rows:minmax(56px,1fr);min-height:0}
+.plq{height:100vh;height:100dvh;min-height:0}
+.plq .pq .qt{font-size:1rem;font-weight:600;opacity:.85}
+.inprev .plq{height:100%}
 .pbtn{background:var(--c);color:#fff;border-radius:16px;font-size:1.1rem;font-size:clamp(1rem,4.8cqw,1.25rem);min-height:62px;min-height:clamp(58px,10.5vh,92px);text-align:left;display:flex;align-items:center;gap:12px;padding:12px 14px;box-shadow:0 5px 0 rgba(0,0,0,.24);line-height:1.2;overflow-wrap:anywhere;animation:popIn .4s cubic-bezier(.2,1.4,.4,1) both}
 .pbtn:nth-child(2){animation-delay:.06s}.pbtn:nth-child(3){animation-delay:.12s}.pbtn:nth-child(4){animation-delay:.18s}
 .pbtn span:last-child{min-width:0}
@@ -404,7 +407,9 @@ input[type=radio],input[type=checkbox]{accent-color:var(--ok);width:18px;height:
 }
 @media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;animation-delay:0s!important;transition:none!important}}
 </style>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
 </head>
 <body>
@@ -441,51 +446,23 @@ const READY_MS = 4600;
 const BOT_NAMES = ['Andrea', 'Benja', 'Coni', 'Diego', 'Eli', 'Feña', 'Gabi', 'Hugo', 'Isi', 'Javi', 'Kari', 'Lucho', 'Majo', 'Nico', 'Oli'];
 const params = new URLSearchParams(location.search);
 const JOIN = params.get('j');
-const TURN_URL_PARAM = params.get('tk');   // respaldo opcional (enlace de credenciales de Metered)
 
-/* Servidores para conectar navegadores. Si la red (oficina, VPN, Wi-Fi corporativo) bloquea la
-   conexión directa, el tráfico pasa por un "puente" TURN en los puertos 80/443. */
-let peerOptsP = null, peerOptsAt = 0;
-const okTurnUrl = u => typeof u === 'string' && /^https:\/\/[a-z0-9-]+\.metered\.live\/api\/v1\/turn\/credentials\?apiKey=[\w-]+$/i.test(u.trim());
-function peerOpts(turnUrl) {
-  if (peerOptsP && Date.now() - peerOptsAt < 6 * 3600e3) return peerOptsP;
-  peerOptsAt = Date.now();
-  peerOptsP = (async () => {
-    const ice = [
-      { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-      { urls: 'stun:stun.cloudflare.com:3478' }
-    ];
-    try { // Open Relay (gratis): credencial temporal calculada con su clave pública
-      const username = String(Math.floor(Date.now() / 1000) + 48 * 3600);
-      const k = await crypto.subtle.importKey('raw', new TextEncoder().encode('openrelayprojectsecret'), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
-      const credential = b64.enc(await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(username)));
-      ice.push({ urls: ['turn:staticauth.openrelay.metered.ca:80', 'turn:staticauth.openrelay.metered.ca:80?transport=tcp',
-        'turn:staticauth.openrelay.metered.ca:443', 'turns:staticauth.openrelay.metered.ca:443?transport=tcp'], username, credential });
-    } catch (e) {}
-    const extra = turnUrl || TURN_URL_PARAM;
-    if (okTurnUrl(extra)) {
-      try {
-        const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 5000);
-        const r = await fetch(extra.trim(), { signal: ctl.signal }); clearTimeout(to);
-        if (r.ok) { const arr = await r.json(); if (Array.isArray(arr)) ice.push(...arr.filter(x => x && x.urls)); }
-      } catch (e) {}
-    }
-    return { debug: 1, config: { iceServers: ice } };
-  })();
-  return peerOptsP;
-}
-/* Prueba de red: ¿se puede llegar al puente desde aquí? */
-async function testNetwork(turnUrl) {
-  const opts = await peerOpts(turnUrl);
-  const pc = new RTCPeerConnection(opts.config);
-  const found = new Set();
-  pc.onicecandidate = e => { if (e.candidate) { const m = / typ (\w+)/.exec(e.candidate.candidate); if (m) found.add(m[1]); } };
-  pc.createDataChannel('t');
-  await pc.setLocalDescription(await pc.createOffer());
-  await new Promise(res => { const end = () => res(); pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') end(); }; setTimeout(end, 8000); });
-  pc.close();
-  return { direct: found.has('srflx'), relay: found.has('relay') };
-}
+/* ---------- Firebase (conexión, login y guardado) ----------
+   Todo viaja por conexiones web normales (HTTPS/WebSocket, puerto 443),
+   así que funciona en redes de oficina, VPN y datos móviles. */
+const FB_CONFIG = {
+  apiKey: 'AIzaSyC27qNXFOQad94he8RFkC8ScXkaTh_NzM4',
+  authDomain: 'ampliada-dx.firebaseapp.com',
+  databaseURL: 'https://ampliada-dx-default-rtdb.firebaseio.com',
+  projectId: 'ampliada-dx',
+  storageBucket: 'ampliada-dx.firebasestorage.app',
+  messagingSenderId: '482067629919',
+  appId: '1:482067629919:web:147575a3297315ff05d8ea'
+};
+let db = null, fbAuth = null;
+const TS = () => firebase.database.ServerValue.TIMESTAMP;
+try { if (typeof firebase !== 'undefined') { firebase.initializeApp(FB_CONFIG); db = firebase.database(); fbAuth = firebase.auth(); } } catch (e) { console.warn(e); }
+function firstAuth() { return new Promise(res => { const off = fbAuth.onAuthStateChanged(u => { off(); res(u); }); }); }
 const app = document.getElementById('app');
 
 /* ------------------------------------------------------------------ utilidades */
@@ -567,42 +544,6 @@ function download(blob, name) {
   const a = el('a', { href: url, download: name });
   document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 3000);
-}
-/* ---------- cifrado del archivo de rondas (AES-GCM con contraseña) ---------- */
-const b64 = {
-  enc(buf) { const u = new Uint8Array(buf); let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); },
-  dec(str) { const s = atob(str); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
-};
-async function deriveKey(pass, salt) {
-  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 250000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-}
-async function sealData(obj, pass, savedAt) {
-  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveKey(pass, salt);
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(obj)));
-  return { app: 'juegos-en-vivo', v: 2, savedAt: savedAt || Date.now(), salt: b64.enc(salt), iv: b64.enc(iv), data: b64.enc(ct) };
-}
-async function openData(file, pass) {
-  const key = await deriveKey(pass, b64.dec(file.salt));
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64.dec(file.iv) }, key, b64.dec(file.data));
-  return JSON.parse(new TextDecoder().decode(pt));
-}
-function askPassword(title, text, confirm) {
-  return modal(close => {
-    const p1 = el('input', { type: 'password', class: 'pw', placeholder: 'Contraseña', autocomplete: confirm ? 'new-password' : 'current-password', 'aria-label': 'Contraseña' });
-    const p2 = confirm ? el('input', { type: 'password', class: 'pw', placeholder: 'Repite la contraseña', autocomplete: 'new-password', 'aria-label': 'Repite la contraseña' }) : null;
-    const err = el('p', { class: 'err', role: 'alert' });
-    const ok = () => {
-      if (p1.value.length < 6) { err.textContent = 'Usa al menos 6 caracteres.'; return; }
-      if (confirm && p1.value !== p2.value) { err.textContent = 'Las contraseñas no coinciden.'; return; }
-      close(p1.value);
-    };
-    [p1, p2].forEach(x => x && x.addEventListener('keydown', e => { if (e.key === 'Enter') ok(); }));
-    setTimeout(() => p1.focus(), 60);
-    return [el('p', { text: title }), el('p', { class: 'hint', text }), p1, p2, err,
-      el('div', { class: 'mact' }, el('button', { class: 'btn light', onclick: () => close(false) }, 'Cancelar'), el('button', { class: 'btn primary', onclick: ok }, 'Aceptar'))];
-  });
 }
 const fmtDate = t => new Date(t).toLocaleString('es-CL', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 
@@ -716,22 +657,14 @@ function hostQuestionView(q, ctx) {
 function playerHead(s) {
   return el('div', { class: 'phead' }, el('span', { class: 'me', text: '👤 ' + s.name }), el('span', { class: 'sc', text: fmt(s.score) + ' pts' }));
 }
-function playerQuestionNodes(s, img, onAnswer, pv) {
+function playerQuestionNodes(s, onAnswer, pv) {
   const q = s.q, left = pv ? q.time * 1000 : s.localEnd - Date.now();
-  let imgNode = null;
-  if (q.img) {
-    imgNode = img
-      ? el('div', { class: 'pimg' }, el('img', { src: img, alt: 'Imagen de la pregunta', class: q.reveal && !pv ? 'revealing' : null,
-          style: q.reveal && !pv ? { '--dur': (q.time * .85) + 's', 'animation-delay': (-(s.elapsedNow || 0) / 1000) + 's' } : null,
-          onclick: q.reveal || pv ? null : () => zoom(img) }))
-      : el('div', { class: 'pimg' }, el('div', { class: 'spinner' }));
-  }
   return [
     el('div', { class: 'pq' },
-      el('div', { class: 'txt' }, el('div', { class: 'eyebrow', text: `Pregunta ${s.qi + 1} de ${s.round.n}` + (q.poll ? ' · Votación' : '') }), el('div', { class: 'qt', text: q.text })),
+      el('div', { class: 'txt' }, el('div', { class: 'eyebrow', text: `Pregunta ${s.qi + 1} de ${s.round.n}` + (q.poll ? ' · Votación' : '') }),
+        el('div', { class: 'qt', text: q.poll ? 'Elige tu respuesta' : 'Elige la alternativa correcta' })),
       el('div', { class: 'pcd', id: pv ? null : 'pcd', text: Math.max(0, Math.ceil(left / 1000)) })),
-    imgNode,
-    el('div', { class: 'pbtns' }, q.options.map((o, k) => el('button', {
+    el('div', { class: 'pbtns n' + q.options.length }, q.options.map((o, k) => el('button', {
       class: 'pbtn', disabled: !pv && left <= 0, style: { '--c': COLORS[q.slots[k]] }, onclick: () => onAnswer && onAnswer(k) }, lt(q.slots[k]), el('span', { text: o }))))
   ];
 }
@@ -754,7 +687,7 @@ function bgLayer() {
   return b;
 }
 
-if (typeof Peer === 'undefined' || typeof qrcode === 'undefined') {
+if (!db || !fbAuth || typeof qrcode === 'undefined') {
   mount(el('div', { class: 'plwrap' }, el('div', { class: 'pl' }, el('div', { class: 'pcenter' },
     el('h1', { text: 'No se pudo cargar' }), el('p', { text: 'Revisa tu conexión a internet y recarga la página.' })))));
 } else if (JOIN) {
@@ -772,7 +705,7 @@ async function Host() {
   let view = { name: 'home' };
   let game = null;            // sala en vivo o prueba
   let live = null;            // refresca solo las zonas dinámicas de la pantalla actual
-  let saveT = null, savedEl = null, saveState = 'ok';
+  let saveT = null, savedEl = null, saveState = 'ok', booted = false;
 
   /* ---------- datos ---------- */
   function q(text, options, correct, extra) { return Object.assign({ id: rid(8), text, img: null, reveal: false, options, correct, time: 20 }, extra || {}); }
@@ -816,231 +749,151 @@ async function Host() {
     setSaved('saving');
     clearTimeout(saveT);
     saveT = setTimeout(writeNow, 300);
+    if (typeof scheduleCloud === 'function' && user) scheduleCloud();
   }
   // si cierras o cambias de pestaña con un cambio pendiente, se guarda de inmediato
-  const flush = () => { if (saveT) writeNow(); };
+  const flush = () => { if (saveT) writeNow(); if (user && unsavedCloud()) cloudSaveNow(true); };
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(); });
   window.addEventListener('pagehide', flush);
 
-  /* ---------------- ACCESO + GUARDADO EN LA NUBE ----------------
-     Tu usuario y clave son la llave que cifra tus rondas. La copia en la nube es
-     el archivo rondas.dat dentro de tu repositorio de GitHub, siempre cifrado. */
-  const CLOUD_FILE = 'rondas.dat';
-  const normUser = u => String(u || '').trim().toLowerCase();
-  const secretOf = (u, p) => normUser(u) + ':' + p;
-  function detectRepo() {
-    const saved = store.get('qdx-repo', null);
-    if (saved && saved.owner && saved.repo) return saved;
-    const h = location.hostname;
-    if (!/\.github\.io$/i.test(h)) return null;
-    const owner = h.split('.')[0];
-    const seg = location.pathname.split('/').filter(Boolean)[0];
-    return { owner, repo: seg && !/\.html?$/i.test(seg) ? seg : owner + '.github.io' };
-  }
-  const repo = detectRepo();
-  const apiUrl = () => `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${CLOUD_FILE}`;
-  let cloud = store.get('qdx-cloud', null) || {};   // { token, savedAt } en este equipo
-  let auth = store.get('qdx-auth', null);           // { user, salt, hash } para verificar la clave en este equipo
-  let session = (() => { try { return JSON.parse(sessionStorage.getItem('qdx-session-auth') || 'null'); } catch (e) { return null; } })();
-  let remote = null, cloudState = 'idle', saveUIEl = null;
+  /* ---------------- ACCESO + GUARDADO EN LA NUBE (Firebase) ----------------
+     Entras con tu correo y clave. Cada cambio se guarda solo en la nube y en este
+     navegador. Las reglas de Firebase dejan ver y editar las rondas solo a tu cuenta. */
+  let user = null, loginMsg = '', cloudState = 'idle', cloudT = null, saveUIEl = null, online0 = true;
+  let uploaded = store.get('qdx-uploaded', {}) || {};   // firma de cada foto ya subida
+  const sig = src => src ? src.length + ':' + src.slice(-48) : '';
+  const syncedAt = () => store.get('qdx-synced', 0) || 0;
+  const unsavedCloud = () => (data.updatedAt || 0) > syncedAt();
+  db.ref('.info/connected').on('value', s => { online0 = !!s.val(); updateSaveUI(); if (online0 && user && unsavedCloud()) scheduleCloud(500); });
 
-  // devuelve el archivo cifrado, false si no existe, o null si no hay conexión
-  async function cloudRead() {
-    const ok = j => (j && j.app === 'juegos-en-vivo' && j.data ? j : false);
-    let net = false;
-    if (repo) {
-      try {
-        const r = await fetch(apiUrl(), { headers: { Accept: 'application/vnd.github.raw' }, cache: 'no-store' });
-        net = true;
-        if (r.ok) return ok(await r.json());
-        if (r.status === 404) return false;
-      } catch (e) {}
-    }
-    if (location.protocol === 'file:') return net ? false : null;
-    try {
-      const r = await fetch(CLOUD_FILE + '?t=' + Date.now(), { cache: 'no-store' });
-      return r.ok ? ok(await r.json()) : false;
-    } catch (e) { return net ? false : null; }
+  function authMsg(e) {
+    const c = (e && e.code) || '';
+    if (/invalid-credential|wrong-password|user-not-found|invalid-email|invalid-login/.test(c)) return 'Correo o clave incorrectos.';
+    if (/too-many-requests/.test(c)) return 'Demasiados intentos. Espera unos minutos e inténtalo de nuevo.';
+    if (/network/.test(c)) return 'No hay conexión a internet.';
+    return 'No se pudo entrar (' + (c || 'error') + ').';
   }
-  async function makeVerifier(user, secret, salt) {
-    salt = salt || crypto.getRandomValues(new Uint8Array(16));
-    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), 'PBKDF2', false, ['deriveBits']);
-    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 250000, hash: 'SHA-256' }, base, 256);
-    return { user: normUser(user), salt: b64.enc(salt), hash: b64.enc(bits) };
+  async function doLogin(email, pass, msg, btn) {
+    if (!email.trim() || !pass) { msg.textContent = 'Escribe tu correo y tu clave.'; return; }
+    btn.disabled = true; msg.textContent = 'Entrando…';
+    try { await fbAuth.signInWithEmailAndPassword(email.trim(), pass); }
+    catch (e) { msg.textContent = authMsg(e); btn.disabled = false; }
   }
-  function setSession(user, secret) {
-    session = { user: normUser(user), secret };
-    try { sessionStorage.setItem('qdx-session-auth', JSON.stringify(session)); } catch (e) {}
+  async function forgot(email, msg) {
+    if (!email.trim()) { msg.textContent = 'Escribe tu correo arriba y vuelve a tocar "¿Olvidaste tu clave?".'; return; }
+    try { await fbAuth.sendPasswordResetEmail(email.trim()); msg.textContent = ''; toast('Te enviamos un correo para crear una clave nueva.'); }
+    catch (e) { msg.textContent = authMsg(e); }
   }
-  function logout() {
+  async function logout() {
     if (game && !game.test) { toast('Cierra la sala en vivo antes de salir.'); return; }
-    game = null; session = null;
-    try { sessionStorage.removeItem('qdx-session-auth'); } catch (e) {}
+    if (unsavedCloud()) await cloudSaveNow();
+    game = null; await fbAuth.signOut();
+  }
+  fbAuth.onAuthStateChanged(async u => {
+    if (!u || u.isAnonymous) { user = null; if (booted) render(); return; }
+    const r = await loadCloud();
+    if (r === 'denied') { loginMsg = 'Esta cuenta no tiene acceso al panel.'; await fbAuth.signOut(); return; }
+    loginMsg = ''; user = u;
+    if (r === 'offline') toast('Sin conexión: trabajas con la copia de este equipo. Se guardará en la nube al volver internet.');
     view = { name: 'home' }; render();
-  }
+  });
 
-  async function doLogin(user, pass, msg, btn) {
-    if (!normUser(user) || !pass) { msg.textContent = 'Escribe tu usuario y tu clave.'; return; }
-    const secret = secretOf(user, pass);
-    btn.disabled = true; msg.textContent = 'Verificando…';
+  // trae las rondas de la nube (o sube las de este equipo si la nube está vacía)
+  async function loadCloud() {
+    let v;
+    try { v = (await db.ref('content').once('value')).val(); }
+    catch (e) { return /permission/i.test((e && (e.code || e.message)) || '') ? 'denied' : 'offline'; }
+    if (!v || !v.data) {                       // primera vez: la nube está vacía
+      if (!data.updatedAt) data.updatedAt = Date.now();
+      await writeNow(); await cloudSaveNow(true);
+      return 'ok';
+    }
+    const cloudAt = v.updatedAt || 0;
+    if (hadLocal && unsavedCloud() && data.updatedAt > cloudAt) {   // cambios de este equipo aún no subidos
+      const keepLocal = await modal(close => [
+        el('p', { text: 'Este equipo tiene cambios que no alcanzaron a guardarse en la nube. ¿Cuál versión quieres usar?' }),
+        el('p', { class: 'hint', text: `Nube: ${fmtDate(cloudAt)} · Este equipo: ${fmtDate(data.updatedAt)}` }),
+        el('div', { class: 'mact' }, el('button', { class: 'btn light', onclick: () => close(false) }, 'La de la nube'), el('button', { class: 'btn primary', onclick: () => close(true) }, 'La de este equipo'))]);
+      if (keepLocal) { await cloudSaveNow(true); return 'ok'; }
+    }
     try {
-      const fresh = await cloudRead();
-      if (fresh !== null) remote = fresh;
-      if (remote) {
-        let payload;
-        try { payload = await openData(remote, secret); } catch (e) { msg.textContent = 'Usuario o clave incorrectos.'; return; }
-        auth = await makeVerifier(user, secret); store.set('qdx-auth', auth);
-        if (payload.token) cloud.token = payload.token;
-        const synced = cloud.savedAt || 0, rAt = remote.savedAt || 0;
-        // el archivo inicial (sin rondas) nunca reemplaza lo que ya preparaste en este equipo
-        let useRemote = !payload.seed && rAt > synced;
-        if (payload.seed && !cloud.savedAt) cloud.savedAt = 0;
-        if (useRemote && hadLocal && data.updatedAt > synced) {
-          useRemote = await modal(close => [
-            el('p', { text: 'En la nube hay una versión más nueva, pero este equipo también tiene cambios sin guardar. ¿Cuál quieres usar?' }),
-            el('p', { class: 'hint', text: `Nube: ${fmtDate(rAt)} · Este equipo: ${fmtDate(data.updatedAt)}` }),
-            el('div', { class: 'mact' }, el('button', { class: 'btn light', onclick: () => close(false) }, 'La de este equipo'), el('button', { class: 'btn primary', onclick: () => close(true) }, 'La de la nube'))]);
-        }
-        if (useRemote) {
-          const d = payload.data && payload.data.rounds ? payload.data : payload;
-          data = normalize(d); data.updatedAt = rAt; cloud.savedAt = rAt; await writeNow();
-        }
-        store.set('qdx-cloud', cloud);
-      } else if (fresh === null && auth) {
-        // sin internet: se valida con la huella guardada en este equipo
-        const v = await makeVerifier(user, secret, b64.dec(auth.salt));
-        if (v.user !== auth.user || v.hash !== auth.hash) { msg.textContent = 'Usuario o clave incorrectos.'; return; }
-      } else if (fresh === null) { msg.textContent = 'No hay conexión con GitHub. Revisa tu internet e inténtalo de nuevo.'; return; }
-      else { msg.textContent = 'Este panel aún no está configurado: falta el archivo rondas.dat en el repositorio.'; return; }
-      msg.textContent = '';
-      setSession(user, secret); view = { name: 'home' }; render();
-    } finally { btn.disabled = false; }
+      const d = JSON.parse(v.data), imgs = v.imgs || {};
+      d.rounds.forEach(r => r.questions.forEach(q => { q.img = q.img ? (imgs[q.id] || null) : null; }));
+      if (d.event && d.event.logo) d.event.logo = imgs._logo || null;
+      data = normalize(d); data.updatedAt = cloudAt;
+      uploaded = {}; Object.entries(imgs).forEach(([k, src]) => { uploaded[k] = sig(src); });
+      store.set('qdx-uploaded', uploaded); store.set('qdx-synced', cloudAt);
+      await writeNow();
+    } catch (e) { console.warn(e); }
+    return 'ok';
   }
-
-  function askToken(problem) {
-    return modal(close => {
-      const tok = el('input', { type: 'password', class: 'pw', placeholder: 'Pega aquí el token (empieza con github_pat_)', 'aria-label': 'Token de GitHub', autocomplete: 'off' });
-      const err = el('p', { class: 'err', role: 'alert', text: problem || '' });
-      const ok = () => {
-        const t = tok.value.trim();
-        if (!/^(github_pat_|ghp_)\w{10,}/.test(t)) { err.textContent = 'Eso no parece un token de GitHub: debe empezar con github_pat_'; return; }
-        close(t);
-      };
-      tok.addEventListener('keydown', e => { if (e.key === 'Enter') ok(); });
-      setTimeout(() => tok.focus(), 60);
-      return [
-        el('p', { text: 'Conecta tu GitHub para guardar (solo la primera vez)' }),
-        el('p', { class: 'hint', text: `Es un permiso para que esta página guarde tus rondas en tu repositorio "${repo.repo}" y en nada más.` }),
-        el('ol', null,
-          el('li', null, 'Abre ', el('a', { href: 'https://github.com/settings/personal-access-tokens/new', target: '_blank', rel: 'noopener', text: 'crear token en GitHub' }), ' (se abre en otra pestaña).'),
-          el('li', { text: 'Token name: "Juegos Ampliada". Expiration: una fecha posterior a la reunión.' }),
-          el('li', { text: `Repository access: "Only select repositories" → ${repo.repo}.` }),
-          el('li', { text: 'Permissions: agrega "Contents" con acceso "Read and write".' }),
-          el('li', { text: 'Toca "Generate token", cópialo y pégalo aquí abajo.' })),
-        el('p', { class: 'hint', text: 'En "Resource owner" debe aparecer tu cuenta personal (no una organización).' }),
-        tok, err,
-        el('div', { class: 'mact' }, el('button', { class: 'btn light', onclick: () => close(false) }, 'Cancelar'), el('button', { class: 'btn primary', onclick: ok }, 'Conectar y guardar'))];
-    });
-  }
-  async function cloudSave(silent, problem) {
-    if (!session) return false;
-    if (!repo) { await writeNow(); toast('Guardado en este navegador. La nube funciona cuando abres el juego desde tu link de GitHub.'); return false; }
-    if (!cloud.token || problem) { const t = await askToken(problem); if (!t) { cloudState = 'idle'; updateSaveUI(); return false; } cloud.token = t; store.set('qdx-cloud', cloud); }
+  function scheduleCloud(ms) { clearTimeout(cloudT); cloudT = setTimeout(() => cloudSaveNow(true), ms == null ? 1200 : ms); }
+  async function cloudSaveNow(silent) {
+    if (!user && !fbAuth.currentUser) return false;
+    clearTimeout(cloudT); cloudT = null;
+    const at = data.updatedAt || Date.now();
     cloudState = 'saving'; updateSaveUI();
-    await writeNow();
     try {
-      const H = { Authorization: 'Bearer ' + cloud.token, Accept: 'application/vnd.github+json' };
-      const put = async () => {
-        let sha;
-        const g = await fetch(apiUrl(), { headers: H, cache: 'no-store' });
-        if (g.status === 401 || g.status === 403) throw { auth: g.status };
-        if (g.ok) sha = (await g.json()).sha; else if (g.status !== 404) throw new Error('GET ' + g.status);
-        const at = Date.now();
-        const file = await sealData({ data, token: cloud.token, user: session.user }, session.secret, at);
-        const body = { message: 'Guardar rondas · ' + new Date(at).toLocaleString('es-CL'), content: btoa(JSON.stringify(file)) };
-        if (sha) body.sha = sha;
-        const res = await fetch(apiUrl(), { method: 'PUT', headers: Object.assign({ 'Content-Type': 'application/json' }, H), body: JSON.stringify(body) });
-        return { res, file };
-      };
-      let { res, file } = await put();
-      if (res.status === 409 || res.status === 422) ({ res, file } = await put());
-      if (res.status === 401 || res.status === 403 || res.status === 404) throw { auth: res.status };
-      if (!res.ok) throw new Error('PUT ' + res.status);
-      remote = file; cloud.savedAt = file.savedAt; store.set('qdx-cloud', cloud);
+      const imgs = {};
+      data.rounds.forEach(r => r.questions.forEach(q => { if (q.img) imgs[q.id] = q.img; }));
+      if (data.event.logo) imgs._logo = data.event.logo;
+      const meta = JSON.parse(JSON.stringify(data, (k, v) => (k === 'img' || k === 'logo') ? (v ? true : null) : v));
+      const up = { 'content/data': JSON.stringify(meta), 'content/updatedAt': at,
+        'public/event': { title: data.event.title || '', subtitle: data.event.subtitle || '', tagline: data.event.tagline || '' } };
+      for (const [id, src] of Object.entries(imgs)) if (uploaded[id] !== sig(src)) up['content/imgs/' + id] = src;
+      for (const id of Object.keys(uploaded)) if (!imgs[id]) up['content/imgs/' + id] = null;
+      if (uploaded._logo !== sig(imgs._logo)) up['public/logo'] = imgs._logo || null;
+      await db.ref().update(up);
+      uploaded = {}; Object.entries(imgs).forEach(([k, src]) => { uploaded[k] = sig(src); });
+      store.set('qdx-uploaded', uploaded); store.set('qdx-synced', at);
       cloudState = 'idle'; updateSaveUI();
       if (!silent) toast('Guardado en la nube ✓');
-      if (view.name === 'home') render();
+      if (data.updatedAt > at) scheduleCloud();
       return true;
     } catch (e) {
-      cloudState = 'idle'; updateSaveUI();
-      if (e && e.auth) {
-        cloud.token = null; store.set('qdx-cloud', cloud);
-        const why = e.auth === 401 ? 'GitHub dice que ese token no es válido o ya venció. Crea uno nuevo y pégalo.'
-          : e.auth === 403 ? 'El token no tiene permiso para escribir: en Permissions, "Contents" debe estar en "Read and write". Si el Resource owner es una organización, crea el token con tu cuenta personal.'
-          : `El token no tiene acceso al repositorio "${repo.repo}": en "Repository access" elige "Only select repositories" y márcalo.`;
-        return cloudSave(silent, why);
-      }
-      toast(e instanceof TypeError ? 'No se pudo conectar con GitHub. Revisa tu internet e inténtalo de nuevo.' : 'No se pudo guardar en la nube (' + (e && e.message || 'error') + '). Tus cambios siguen guardados en este equipo.');
+      console.warn(e); cloudState = 'error'; updateSaveUI();
+      scheduleCloud(8000);
+      if (!silent) toast('No se pudo guardar en la nube. Se reintentará solo; tus cambios están seguros en este equipo.');
       return false;
     }
   }
-  async function changePassword() {
-    const pass = await askPassword('Nueva clave', 'Desde ahora entrarás con esta clave en todos los equipos. Anótala: si la olvidas no se puede recuperar.', true);
-    if (!pass) return;
-    if (pass.length < 8) { toast('La clave debe tener al menos 8 caracteres.'); return; }
-    const old = session;
-    setSession(session.user, secretOf(session.user, pass));
-    data.updatedAt = Date.now();
-    if (await cloudSave(true)) { auth = await makeVerifier(session.user, session.secret); store.set('qdx-auth', auth); toast('Clave cambiada ✓'); }
-    else { setSession(old.user, old.secret); toast('No se cambió la clave porque no se pudo guardar en la nube.'); }
-  }
-  const unsavedCloud = () => !cloud.savedAt || data.updatedAt > cloud.savedAt;
   function saveUI() { saveUIEl = el('div', { class: 'saveui' }); updateSaveUI(); return saveUIEl; }
   function updateSaveUI() {
     if (!saveUIEl) return;
-    let kids;
-    if (saveState === 'err') kids = [el('span', { class: 'saved', text: '⚠ No se pudo guardar en este navegador' })];
-    else if (!repo) kids = [el('span', { class: 'saved', text: saveState === 'saving' ? 'Guardando…' : '✓ Guardado en este navegador' })];
-    else if (cloudState === 'saving') kids = [el('span', { class: 'saved', text: 'Guardando en la nube…' })];
-    else if (unsavedCloud()) kids = [el('span', { class: 'saved', text: 'Cambios sin guardar' }), el('button', { class: 'btn primary sm', onclick: () => cloudSave() }, '💾 Guardar')];
-    else kids = [el('span', { class: 'saved', text: '✓ Guardado en la nube' })];
+    let t;
+    if (saveState === 'err') t = '⚠ No se pudo guardar en este navegador';
+    else if (!online0) t = '⚠ Sin conexión · se guardará al volver internet';
+    else if (cloudState === 'saving' || saveState === 'saving' || (unsavedCloud() && cloudT)) t = 'Guardando…';
+    else if (cloudState === 'error' || unsavedCloud()) t = '⚠ Pendiente de guardar en la nube';
+    else t = '✓ Guardado en la nube';
+    const kids = [el('span', { class: 'saved', text: t })];
+    if (online0 && (cloudState === 'error' || (unsavedCloud() && !cloudT && cloudState !== 'saving'))) kids.push(el('button', { class: 'btn primary sm', onclick: () => cloudSaveNow() }, '💾 Guardar'));
     saveUIEl.replaceChildren(...kids);
   }
   function cloudCard() {
-    if (!repo) return el('div', { class: 'glass sync' }, el('span', { class: 'ic', text: '💻' }),
-      el('div', { class: 'txt' }, el('b', { text: 'Tus cambios se guardan en este navegador' }), el('span', { text: 'Para guardar en la nube y entrar desde cualquier equipo, abre el juego desde tu link de GitHub Pages.' })));
-    if (unsavedCloud()) return el('div', { class: 'glass sync attn' }, el('span', { class: 'ic', text: '☁️' }),
-      el('div', { class: 'txt' }, el('b', { text: cloud.savedAt ? 'Tienes cambios sin guardar en la nube' : 'Guarda en la nube para no perder nada' }),
-        el('span', { text: cloud.savedAt ? `Última vez guardado: ${fmtDate(cloud.savedAt)}.` : 'Así podrás entrar con tu usuario y clave desde cualquier equipo. La primera vez te pedirá conectar tu GitHub.' })),
-      el('button', { class: 'btn primary sm', onclick: () => cloudSave() }, '💾 Guardar ahora'));
-    return el('div', { class: 'glass sync ok' }, el('span', { class: 'ic', text: '✅' }),
-      el('div', { class: 'txt' }, el('b', { text: 'Todo guardado en la nube' }), el('span', { text: `Última vez: ${fmtDate(cloud.savedAt)} · entra desde cualquier equipo con tu usuario y clave.` })));
+    return el('div', { class: 'glass sync ok' }, el('span', { class: 'ic', text: '☁️' }),
+      el('div', { class: 'txt' }, el('b', { text: 'Todo se guarda solo en la nube' }),
+        el('span', { text: 'Cada cambio queda guardado automáticamente. Puedes entrar desde cualquier equipo con tu correo y clave.' })));
   }
 
   function renderLogin() {
-    const ev = data.event, create = false, notReady = remote === false;
-    const u = el('input', { type: 'text', class: 'pw', placeholder: 'Usuario', autocomplete: 'username', value: auth ? auth.user : '', 'aria-label': 'Usuario', autocapitalize: 'off' });
-    const p1 = el('input', { type: 'password', class: 'pw', placeholder: create ? 'Crea una clave (mínimo 8 caracteres)' : 'Clave', autocomplete: create ? 'new-password' : 'current-password', 'aria-label': 'Clave' });
-    const p2 = create ? el('input', { type: 'password', class: 'pw', placeholder: 'Repite la clave', autocomplete: 'new-password', 'aria-label': 'Repite la clave' }) : null;
-    const msg = el('p', { class: 'err', role: 'alert' });
-    const btn = el('button', { class: 'btn primary big', type: 'submit' }, create ? 'Crear acceso' : 'Entrar');
-    const form = el('form', { class: 'card login', onsubmit: e => { e.preventDefault(); doLogin(u.value, p1.value, msg, btn); } },
-      el('h2', { text: create ? 'Crea tu acceso' : 'Ingresa al panel' }),
-      el('p', { class: 'hint', text: create
-        ? 'Con este usuario y clave entrarás a preparar y lanzar los juegos desde cualquier equipo. Anótalos: si olvidas la clave no se puede recuperar.'
-        : 'Solo quien tenga el usuario y la clave puede ver y editar las rondas.' }),
-      u, p1, p2, msg, btn,
-      create ? el('p', { class: 'hint', text: '¿Ya creaste tu acceso en otro equipo? Entra allá, toca 💾 Guardar y luego recarga esta página.' }) : null);
-    const box = notReady
-      ? el('div', { class: 'card login' }, el('h2', { text: 'Panel no disponible' }),
-          el('p', { class: 'hint', text: 'Este panel aún no está configurado. Si eres la organizadora, sube el archivo rondas.dat a tu repositorio de GitHub y recarga esta página.' }))
-      : form;
+    const ev = data.event;
+    const u = el('input', { type: 'email', class: 'pw', placeholder: 'Correo', autocomplete: 'username', value: store.get('qdx-email', ''), 'aria-label': 'Correo', autocapitalize: 'off' });
+    const p1 = el('input', { type: 'password', class: 'pw', placeholder: 'Clave', autocomplete: 'current-password', 'aria-label': 'Clave' });
+    const msg = el('p', { class: 'err', role: 'alert', text: loginMsg });
+    const btn = el('button', { class: 'btn primary big', type: 'submit' }, 'Entrar');
+    const form = el('form', { class: 'card login', onsubmit: e => { e.preventDefault(); store.set('qdx-email', u.value.trim()); doLogin(u.value, p1.value, msg, btn); } },
+      el('h2', { text: 'Ingresa al panel' }),
+      el('p', { class: 'hint', text: 'Solo la organizadora puede ver y editar las rondas.' }),
+      u, p1, msg, btn,
+      el('p', { class: 'hint', style: { 'margin-top': '12px', 'text-align': 'center' } },
+        el('a', { href: '#', style: { color: 'var(--orange3)', 'font-weight': '700' }, onclick: e => { e.preventDefault(); forgot(u.value, msg); } }, '¿Olvidaste tu clave?')));
     mount(el('div', { class: 'topbar' }, brand(), el('div', { class: 'spacer' }), fsBtn()),
       el('div', { class: 'loginwrap' },
         el('div', null, evTitle(ev.title), evSub(ev.subtitle), ev.tagline ? el('div', { class: 'tagline', text: ev.tagline }) : null,
           el('p', { class: 'lead', style: { 'margin-top': '28px' }, text: 'Panel de juegos en vivo' })),
-        box));
-    if (!notReady) setTimeout(() => (u.value ? p1 : u).focus(), 60);
+        form));
+    setTimeout(() => (u.value ? p1 : u).focus(), 60);
   }
   function setSaved(s) {
     saveState = s;
@@ -1057,7 +910,7 @@ async function Host() {
     if (e.key === 'ArrowRight' || e.key === 'PageDown') { const b = document.getElementById('primary'); if (b && !b.disabled) { e.preventDefault(); b.click(); } }
   });
   document.addEventListener('keydown', e => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && session && view.name !== 'game') { e.preventDefault(); cloudSave(); }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && user && view.name !== 'game') { e.preventDefault(); cloudSaveNow(); }
   });
   document.addEventListener('paste', e => {
     if (view.name !== 'editor' || !view.onPaste) return;
@@ -1089,7 +942,7 @@ async function Host() {
   function render() {
     live = null; view.onPaste = null; savedEl = null; saveUIEl = null;
     window.scrollTo(0, 0);
-    if (!session) return renderLogin();
+    if (!user) return renderLogin();
     if (view.name === 'editor') return renderEditor();
     if (view.name === 'game' && game) {
       if (game.status !== 'open') return renderConnecting();
@@ -1134,7 +987,7 @@ async function Host() {
         el('div', { class: 'sechead' }, el('div', null, el('h2', { text: 'Tus rondas' }), el('p', { text: 'Cada ronda tiene su propio ganador. Las preguntas solo se ven al editar, así nadie ve spoilers si se proyecta tu pantalla.' }))),
         rounds,
         eventSettings(),
-        el('p', { class: 'foot-hint', text: 'Tus cambios se guardan automáticamente en este navegador. Para tenerlos en otro equipo, usa "Preparar archivo para el sitio".' })));
+        el('p', { class: 'foot-hint', text: 'Tus cambios se guardan solos en la nube. Puedes entrar desde cualquier equipo con tu correo y clave.' })));
   }
 
   function roundCard(r, i) {
@@ -1170,31 +1023,13 @@ async function Host() {
         el('div', { class: 'row' }, ev.logo ? el('img', { class: 'logoprev', src: ev.logo, alt: 'Logo actual' }) : null,
           el('button', { class: 'btn light sm', onclick: () => logoIn.click() }, ev.logo ? 'Cambiar logo' : 'Subir logo'),
           ev.logo ? el('button', { class: 'btn light sm', onclick: () => { ev.logo = null; persist(); render(); } }, 'Quitar') : null, logoIn)),
-      el('div', { class: 'field' }, el('label', { text: 'Conexión en redes de oficina' }),
-        el('p', { class: 'hint', style: { 'margin-top': '0' }, text: 'Si una red bloquea la conexión directa, el juego usa automáticamente un puente gratuito. Prueba la red donde harás la reunión:' }),
-        el('div', { class: 'row' }, el('button', { class: 'btn light sm', onclick: async e => {
-          const b = e.currentTarget; b.disabled = true; b.textContent = 'Probando… (8 s)';
-          try {
-            const r = await testNetwork(ev.turnUrl);
-            await modal(close => [
-              el('p', { text: r.relay ? '✅ Esta red funciona: el puente de respaldo está disponible.' : r.direct ? '⚠️ La conexión directa funciona, pero el puente no respondió.' : '❌ Esta red bloquea la conexión y el puente no respondió.' }),
-              el('p', { class: 'hint', text: r.relay ? 'Aunque el Wi-Fi bloquee conexiones directas, los celulares podrán unirse a través del puente.'
-                : r.direct ? 'En redes de casa o datos móviles funcionará. En redes muy restringidas podría fallar: agrega el respaldo de abajo.'
-                : 'Prueba con otra red (por ejemplo, datos móviles o compartir internet desde tu celular) o agrega el respaldo de abajo.' }),
-              el('div', { class: 'mact' }, el('button', { class: 'btn primary', onclick: () => close(true) }, 'Entendido'))]);
-          } catch (err) { toast('No se pudo hacer la prueba en este navegador.'); }
-          b.disabled = false; b.textContent = '📶 Probar la red de este equipo';
-        } }, '📶 Probar la red de este equipo')),
-        el('details', { style: { 'margin-top': '10px' } }, el('summary', { class: 'flabel', style: { cursor: 'pointer' }, text: 'Respaldo opcional (solo si la prueba falla)' }),
-          el('p', { class: 'hint', text: 'Crea una cuenta gratuita en metered.ca, ve a "TURN Server" y copia el enlace de credenciales (empieza con https:// y termina con ?apiKey=…). Pégalo aquí y guarda.' }),
-          el('input', { type: 'text', value: ev.turnUrl || '', placeholder: 'https://tu-app.metered.live/api/v1/turn/credentials?apiKey=…', oninput: e => { ev.turnUrl = e.target.value.trim(); peerOptsP = null; persist(); } }))),
       el('div', { class: 'field' }, el('label', { text: 'Tu acceso' }),
-        el('div', { class: 'row' }, el('span', { class: 'hint', style: { margin: '0' }, text: 'Usuario: ' + (session ? session.user : '') }),
-          el('button', { class: 'btn light sm', onclick: changePassword }, '🔑 Cambiar clave'))),
+        el('div', { class: 'row' }, el('span', { class: 'hint', style: { margin: '0' }, text: 'Correo: ' + ((fbAuth.currentUser && fbAuth.currentUser.email) || '') }),
+          el('button', { class: 'btn light sm', onclick: async () => { try { await fbAuth.sendPasswordResetEmail(fbAuth.currentUser.email); toast('Te enviamos un correo para cambiar tu clave.'); } catch (e) { toast('No se pudo enviar el correo. Inténtalo de nuevo.'); } } }, '🔑 Cambiar clave'))),
       el('div', { class: 'field' }, el('label', { text: 'Respaldo de tus rondas (incluye las fotos)' }),
         el('div', { class: 'row' }, el('button', { class: 'btn light sm', onclick: exportData }, '⬇ Exportar respaldo'),
           el('button', { class: 'btn light sm', onclick: () => imp.click() }, '⬆ Importar respaldo'), imp),
-        el('p', { class: 'hint', text: 'Exporta antes de la reunión: si cambias de computador o de navegador, importas el archivo y queda todo igual.' })));
+        el('p', { class: 'hint', text: 'Tus rondas ya se guardan en la nube; este archivo es una copia extra por si acaso. Guárdalo en tu computador (no lo subas a GitHub).' })));
   }
   async function shrinkImageFile(file, max) { return fileToImage(file, max); }
   function exportData() {
@@ -1309,7 +1144,7 @@ async function Host() {
       prev.replaceChildren(
         el('div', { class: 'eyebrow', text: 'Vista previa' }),
         el('div', null, el('p', { class: 'prevnote', text: 'En la pantalla proyectada' }), scaledBox(1280, 720, el('div', { style: { padding: '26px 34px', height: '100%' } }, hostQuestionView(cq, { idx: idx(), total: r.questions.length, roundName: r.name, preview: true })))),
-        el('div', null, el('p', { class: 'prevnote', text: 'En el celular' }), el('div', { class: 'phone' }, scaledBox(375, 760, el('div', { class: 'plwrap inprev', style: { height: '100%' } }, el('div', { class: 'pl' }, playerHead(s), playerQuestionNodes(s, cq.img, null, true)))))));
+        el('div', null, el('p', { class: 'prevnote', text: 'En el celular' }), el('div', { class: 'phone' }, scaledBox(375, 760, el('div', { class: 'plwrap inprev', style: { height: '100%' } }, el('div', { class: 'pl plq' }, playerHead(s), playerQuestionNodes(s, null, true)))))));
     }
 
     mount(
@@ -1329,7 +1164,7 @@ async function Host() {
      MOTOR DEL JUEGO (sirve igual para la sala en vivo y para el modo prueba)
      ================================================================== */
   function newGame(test) {
-    return { test, peer: null, code: '', joinUrl: '', qrSvg: '', status: 'open', players: new Map(), connPid: new Map(), kicked: new Set(),
+    return { test, room: null, offs: null, code: '', joinUrl: '', qrSvg: '', status: 'open', players: new Map(), connPid: new Map(), kicked: new Set(),
       phase: 'hub', round: null, qi: -1, qStart: 0, qEnd: 0, timer: null, done: {}, createdAt: Date.now(), back: null, botTimers: [] };
   }
   const list = () => [...game.players.values()];
@@ -1364,100 +1199,80 @@ async function Host() {
     return { qs, errs };
   }
 
-  /* ---------- red (solo sala en vivo) ---------- */
+  /* ---------- red (solo sala en vivo, por Firebase) ----------
+     rooms/CODIGO/msgs/UID   → lo que manda cada celular (unirse, responder)
+     rooms/CODIGO/online/UID → presencia de cada celular
+     rooms/CODIGO/pv/UID     → lo que debe mostrar cada celular */
   function openLive(resume) {
     if (game && game.test) exitTest(true);
     game = newGame(false);
     if (resume) {
-      game.code = resume.code; game.createdAt = resume.createdAt || Date.now(); game.done = resume.done || {};
+      game.createdAt = resume.createdAt || Date.now(); game.done = resume.done || {};
       (resume.kicked || []).forEach(k => game.kicked.add(k));
-      (resume.players || []).forEach(p => game.players.set(p.pid, { pid: p.pid, name: p.name, joinedAt: p.joinedAt, rs: p.rs || {}, conn: null, online: false, seen: 0, imgSent: new Set() }));
+      (resume.players || []).forEach(p => game.players.set(p.pid, { pid: p.pid, name: p.name, joinedAt: p.joinedAt, rs: p.rs || {}, online: false }));
     }
     game.status = 'connecting'; view = { name: 'game' }; render();
-    peerOptsP = null;
-    connectPeer(game, resume ? resume.code : null, 0);
+    startRoom(game, resume ? resume.code : null);
   }
-  async function connectPeer(g, fixed, attempt) {
-    const code = fixed || rid(6);
-    const opts = await peerOpts(data.event.turnUrl);
-    if (game !== g) return;
-    const pr = new Peer(PREFIX + code, opts);
-    g.peer = pr;
-    pr.on('open', () => {
-      if (g.peer !== pr || game !== g) return;
-      g.code = code;
-      g.joinUrl = location.origin + location.pathname + '?j=' + code + (okTurnUrl(data.event.turnUrl) ? '&tk=' + encodeURIComponent(data.event.turnUrl.trim()) : '');
-      g.qrSvg = makeQR(g.joinUrl);
+  async function startRoom(g, fixed) {
+    try {
+      let code = fixed;
+      if (!code) {
+        for (let i = 0; i < 5; i++) { const c = rid(6); if (!(await db.ref('rooms/' + c + '/meta').once('value')).exists()) { code = c; break; } }
+        if (!code) throw new Error('code');
+        await db.ref('rooms/' + code + '/meta').set({ createdAt: TS(), open: true });
+      } else await db.ref('rooms/' + code + '/meta').update({ open: true });
+      if (game !== g) return;
+      g.room = db.ref('rooms/' + code);
+      g.code = code; g.joinUrl = location.origin + location.pathname + '?j=' + code; g.qrSvg = makeQR(g.joinUrl);
+      const msgs = g.room.child('msgs'), on = g.room.child('online');
+      const onM = snap => { if (game === g) onMsg(snap.key, snap.val()); };
+      const onO = snap => { if (game === g) setOnline(snap.key, !!snap.val()); };
+      const offO = snap => { if (game === g) setOnline(snap.key, false); };
+      msgs.on('child_added', onM); msgs.on('child_changed', onM);
+      on.on('child_added', onO); on.on('child_changed', onO); on.on('child_removed', offO);
+      g.offs = () => { msgs.off(); on.off(); };
       g.status = 'open'; saveSession(); wakeLock(); gameRender();
-    });
-    pr.on('connection', c => setupConn(g, c));
-    pr.on('disconnected', () => setTimeout(() => { try { if (!pr.destroyed && pr.disconnected) pr.reconnect(); } catch (e) {} }, 1500));
-    pr.on('error', err => {
-      if (g.peer !== pr || game !== g) return;
-      if (g.status !== 'open') {
-        try { pr.destroy(); } catch (e) {}
-        if (err.type === 'unavailable-id') {
-          if (fixed && attempt < 15) { g.statusMsg = 'Recuperando el código ' + fixed.toUpperCase() + '…'; gameRender(); setTimeout(() => connectPeer(g, fixed, attempt + 1), 2000); }
-          else { if (fixed) toast('No se pudo recuperar el código anterior: se creó uno nuevo. Muestra el QR otra vez.'); connectPeer(g, null, 0); }
-          return;
-        }
-        if (attempt < 3) { setTimeout(() => connectPeer(g, fixed, attempt + 1), 2000); return; }
-        g.status = 'error'; gameRender();
-      } else if (err.type !== 'peer-unavailable') console.warn('PeerJS', err.type, err);
-    });
+      if (fixed) broadcast();
+    } catch (e) {
+      console.warn(e); if (game !== g) return;
+      g.status = 'error'; gameRender();
+    }
   }
-  function setupConn(g, conn) {
-    conn.on('data', m => { if (game === g) onMsg(conn, m); });
-    conn.on('close', () => dropConn(g, conn));
-    conn.on('error', () => dropConn(g, conn));
+  function setOnline(uid, v) {
+    const p = game.players.get(uid);
+    if (p && p.online !== v) { p.online = v; refresh(); }
   }
-  function dropConn(g, conn) {
-    const pid = g.connPid.get(conn); g.connPid.delete(conn);
-    const p = pid && g.players.get(pid);
-    if (p && p.conn === conn) { p.conn = null; p.online = false; if (game === g) refresh(); }
+  function send(p, m) { if (p.bot || !game || !game.room) return; game.room.child('pv/' + p.pid).set(m).catch(() => {}); }
+  function broadcast() {
+    if (!game || !game.room) return;
+    const up = {};
+    for (const p of game.players.values()) if (!p.bot) up['pv/' + p.pid] = pview(p);
+    if (Object.keys(up).length) game.room.update(up).catch(() => {});
   }
-  function send(p, m) { if (!p.conn) return; try { if (p.conn.open) p.conn.send(m); } catch (e) {} }
-  function broadcast() { if (!game) return; for (const p of game.players.values()) send(p, pview(p)); }
   function uniqueName(name, pid) {
     const taken = new Set(list().filter(p => p.pid !== pid).map(p => p.name.toLowerCase()));
     if (!taken.has(name.toLowerCase())) return name;
     for (let i = 2; ; i++) { const n = name.slice(0, 23) + ' ' + i; if (!taken.has(n.toLowerCase())) return n; }
   }
-  function onMsg(conn, m) {
-    if (!m || typeof m !== 'object') return;
+  function onMsg(uid, m) {
+    if (!m || typeof m !== 'object' || !uid) return;
     if (m.t === 'join') {
-      const pid = String(m.pid || '').slice(0, 40); if (!pid) return;
-      if (game.kicked.has(pid)) { try { conn.send({ t: 'kicked' }); } catch (e) {} setTimeout(() => { try { conn.close(); } catch (e) {} }, 300); return; }
-      let p = game.players.get(pid);
-      if (p) {
-        if (p.conn && p.conn !== conn) { const old = p.conn; game.connPid.delete(old); try { old.close(); } catch (e) {} }
-        p.conn = conn; p.online = true;
-      } else {
-        p = { pid, name: uniqueName(cleanName(m.name) || 'Anónimo', pid), joinedAt: Date.now(), rs: {}, conn, online: true };
-        game.players.set(pid, p);
+      if (game.kicked.has(uid)) { game.room.child('pv/' + uid).set({ t: 'kicked' }); return; }
+      let p = game.players.get(uid);
+      if (!p) {
+        p = { pid: uid, name: uniqueName(cleanName(m.name) || 'Anónimo', uid), joinedAt: Date.now(), rs: {}, online: true };
+        game.players.set(uid, p);
         if (game.phase === 'hub') Sound.join();
         saveSession();
-      }
-      p.seen = Date.now(); p.imgSent = new Set();
-      game.connPid.set(conn, pid);
+      } else p.online = true;
       send(p, pview(p));
-      if (game.round && ['ready', 'question'].includes(game.phase)) sendImg(p, game.round.questions[game.qi]);
       refresh();
       return;
     }
-    const p = game.players.get(game.connPid.get(conn)); if (!p) return;
-    p.seen = Date.now();
-    if (!p.online) { p.online = true; refresh(); }
-    if (m.t === 'ping') send(p, { t: 'pong' });
+    const p = game.players.get(uid); if (!p) return;
     if (m.t === 'answer') answer(p, m.qi, m.opt);
   }
-  // Latido: marca desconectado a quien no da señales
-  setInterval(() => {
-    if (!game || game.test) return;
-    let ch = false;
-    for (const p of game.players.values()) if (p.online && Date.now() - (p.seen || 0) > 16000) { p.online = false; ch = true; }
-    if (ch) refresh();
-  }, 3000);
   // Cuenta regresiva en pantalla
   let lastTick = 0;
   setInterval(() => {
@@ -1478,7 +1293,8 @@ async function Host() {
   async function closeLive() {
     if (!await confirmBox('¿Cerrar la sala? Los celulares se desconectan y se borran los puntajes de hoy (descarga los resultados antes si los necesitas).', 'Cerrar sala', true)) return;
     clearTimeout(game.timer);
-    try { game.peer && game.peer.destroy(); } catch (e) {}
+    try { game.offs && game.offs(); } catch (e) {}
+    try { if (game.room) await game.room.remove(); } catch (e) {}
     store.del('qdx-session'); game = null; view = { name: 'home' }; render();
   }
 
@@ -1496,7 +1312,7 @@ async function Host() {
       if (['ready', 'question', 'reveal', 'board'].includes(g.phase)) {
         const x = R.questions[g.qi], a = me.answers[x.id];
         v.qi = g.qi;
-        v.q = { id: x.id, text: x.text, options: x.options, slots: x.slots, poll: x.correct < 0, img: !!x.img, reveal: x.reveal, time: x.time };
+        v.q = { id: x.id, options: x.options, slots: x.slots, poll: x.correct < 0, time: x.time };
         v.my = a ? a.opt : null;
         if (g.phase === 'ready') v.readyIn = Math.max(0, g.qStart - Date.now());
         if (g.phase === 'question') { v.remaining = Math.max(0, g.qEnd - Date.now()); v.elapsed = Date.now() - g.qStart; }
@@ -1507,12 +1323,6 @@ async function Host() {
     }
     return v;
   }
-  function sendImg(p, x) {
-    if (!x || !x.img || !p.conn || (p.imgSent && p.imgSent.has(x.id))) return;
-    send(p, { t: 'img', id: x.id, data: x.imgSmall || x.img });
-    (p.imgSent = p.imgSent || new Set()).add(x.id);
-  }
-
   /* ---------- flujo ---------- */
   async function launchRound(roundId, onlyQ) {
     const r = findRound(roundId); if (!r) return false;
@@ -1524,7 +1334,6 @@ async function Host() {
     for (const p of game.players.values()) delete p.rs[id];
     delete game.done[id];
     game.qi = -1; game.phase = 'intro';
-    qs.forEach(x => { if (x.img) shrinkImage(x.img, 720, .76).then(s => { x.imgSmall = s; }).catch(() => {}); });
     Sound.dice(); view = { name: 'game' }; render(); broadcast(); saveSession();
     return true;
   }
@@ -1534,7 +1343,6 @@ async function Host() {
     g.qi = i; g.phase = 'ready'; g.qStart = Date.now() + READY_MS; g.qEnd = g.qStart + x.time * 1000;
     g.timer = setTimeout(() => beginQuestion(i), READY_MS);
     Sound.dice(); gameRender(); broadcast();
-    for (const p of g.players.values()) sendImg(p, x);
   }
   function beginQuestion(i) {
     const g = game; if (!g || g.phase !== 'ready' || g.qi !== i) return;
@@ -1593,7 +1401,7 @@ async function Host() {
   function toHub() { clearTimeout(game.timer); game.round = null; game.phase = 'hub'; render(); broadcast(); }
   function kick(p) {
     game.kicked.add(p.pid);
-    if (p.conn) { send(p, { t: 'kicked' }); const c = p.conn; setTimeout(() => { try { c.close(); } catch (e) {} }, 300); }
+    send(p, { t: 'kicked' });
     game.players.delete(p.pid); refresh(); broadcast(); saveSession();
   }
 
@@ -1673,7 +1481,7 @@ async function Host() {
       game.status === 'error'
         ? [el('p', { text: 'No se pudo abrir la sala. Revisa tu conexión a internet.' }), el('div', { class: 'mact', style: { 'justify-content': 'center' } },
             el('button', { class: 'btn light', onclick: () => { game = null; view = { name: 'home' }; render(); } }, 'Volver'),
-            el('button', { class: 'btn primary', onclick: () => { const s = store.get('qdx-session', null); game = null; openLive(s); } }, 'Reintentar'))]
+            el('button', { class: 'btn primary', onclick: () => { const s = store.get('qdx-session', null); game = null; openLive(s && s.code ? s : null); } }, 'Reintentar'))]
         : [el('div', { class: 'spinner' }), el('p', { text: game.statusMsg || 'Abriendo la sala…' })])));
   }
 
@@ -1843,8 +1651,10 @@ async function Host() {
   }
 
   mount(el('div', { class: 'plwrap' }, el('div', { class: 'pl' }, el('div', { class: 'pcenter' }, el('div', { class: 'spinner' })))));
-  remote = await cloudRead();
-  render();
+  try { const pe = (await db.ref('public/event').once('value')).val(); if (pe && !hadLocal) Object.assign(data.event, pe); } catch (e) {}
+  const u0 = await firstAuth();
+  booted = true;
+  if (!u0 || u0.isAnonymous) render();
 }
 
 /* ==================================================================
@@ -1852,27 +1662,19 @@ async function Host() {
    ================================================================== */
 function Player() {
   const code = JOIN.toLowerCase().replace(/[^a-z0-9]/g, '');
-  const hostId = PREFIX + code;
-  let pid = store.get('qdx-pid', null);
-  if (!pid) { pid = rid(12); store.set('qdx-pid', pid); }
+  const room = db.ref('rooms/' + code);
   let name = store.get('qdx-name', '');
   let ev = store.get('qdx-ev', null);
-  let peer = null, conn = null, st = null, joined = false, kicked = false;
-  let retryT = null, pingT = null, fails = 0, lastKey = '', lastSec = 0, lastIn = 0;
-  const imgs = new Map();
+  let uid = null, st = null, joined = false, kicked = false, seq = 0, lastKey = '', lastSec = 0, pvRef = null, connRef = null;
 
   const bar = el('div', { class: 'netbar hidden', role: 'status' });
   document.body.append(bar);
   const showBar = t => { bar.textContent = t; bar.classList.remove('hidden'); };
   const hideBar = () => bar.classList.add('hidden');
   const page = (...kids) => mount(el('div', { class: 'plwrap' }, el('div', { class: 'pl' }, kids)));
+  const pageQ = (...kids) => mount(el('div', { class: 'plwrap' }, el('div', { class: 'pl plq' }, kids)));
   const evBlock = () => ev && ev.title ? el('div', { class: 'pev' }, evTitle(ev.title, 'div'), ev.subtitle ? evSub(ev.subtitle) : null) : null;
 
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && joined && !kicked && !(conn && conn.open)) connect();
-  });
-  // si la pantalla principal deja de responder (por ejemplo, se recargó), reconectar
-  setInterval(() => { if (joined && !kicked && conn && conn.open && Date.now() - lastIn > 12000) fail('Reconectando con la sala…'); }, 3000);
   setInterval(() => {
     const n = document.getElementById('pcd'); if (!n || !st || st.phase !== 'question') return;
     const left = Math.max(0, st.localEnd - Date.now()), sec = Math.ceil(left / 1000);
@@ -1881,14 +1683,18 @@ function Player() {
     if (left <= 0) document.querySelectorAll('.pbtn').forEach(b => { b.disabled = true; });
   }, 200);
 
-  renderName();
+  page(el('div', { class: 'pcenter' }, el('div', { class: 'spinner' })));
+  (async () => {
+    try { const pe = (await db.ref('public/event').once('value')).val(); if (pe && pe.title) { ev = pe; store.set('qdx-ev', ev); } } catch (e) {}
+    renderName();
+  })();
 
   function renderName(err) {
     const input = el('input', { type: 'text', maxLength: 26, value: name, placeholder: 'Tu nombre', autocomplete: 'nickname', enterKeyHint: 'go', 'aria-label': 'Tu nombre' });
     const go = () => {
       const n = cleanName(input.value);
       if (!n) { renderName('Escribe tu nombre para entrar.'); return; }
-      name = n; store.set('qdx-name', n); joined = true; wakeLock();
+      name = n; store.set('qdx-name', n); wakeLock();
       page(el('div', { class: 'pcenter' }, el('div', { class: 'spinner' }), el('p', { text: 'Conectando con la sala…' })));
       connect();
     };
@@ -1899,58 +1705,54 @@ function Player() {
     setTimeout(() => input.focus(), 60);
   }
 
-  function cleanup() {
-    clearInterval(pingT);
-    const c = conn, p = peer; conn = null; peer = null;
-    try { c && c.close(); } catch (e) {}
-    try { p && p.destroy(); } catch (e) {}
-  }
-  function fail(msg) {
-    if (kicked) return;
-    cleanup(); fails++;
-    showBar((msg || 'Se perdió la conexión.') + ' Reintentando…' + (fails >= 2 ? ' Si estás en el Wi-Fi de la oficina o con VPN, prueba con datos móviles.' : ''));
-    clearTimeout(retryT); retryT = setTimeout(connect, Math.min(1500 + fails * 700, 7000));
+  function send(m) {
+    if (!uid) return Promise.resolve();
+    seq++;
+    return room.child('msgs/' + uid).set(Object.assign({}, m, { n: seq, at: TS() })).catch(() => {});
   }
   async function connect() {
-    clearTimeout(retryT); cleanup();
-    const opts = await peerOpts();
-    if (kicked) return;
-    const pr = new Peer(opts); peer = pr;
-    pr.on('open', () => {
-      if (peer !== pr) return;
-      const c = pr.connect(hostId, { reliable: true }); conn = c;
-      const to = setTimeout(() => { if (conn === c && !c.open) fail('No pudimos conectar con la sala.'); }, 12000);
-      c.on('open', () => {
-        clearTimeout(to); if (conn !== c) return;
-        lastIn = Date.now();
-        c.send({ t: 'join', pid, name });
-        clearInterval(pingT); pingT = setInterval(() => { try { if (c.open) c.send({ t: 'ping' }); } catch (e) {} }, 4000);
-      });
-      c.on('data', m => { if (conn === c) { lastIn = Date.now(); onMsg(m); } });
-      c.on('close', () => { if (conn === c) fail(); });
-      c.on('error', () => { if (conn === c) fail(); });
+    try {
+      let u = fbAuth.currentUser || await firstAuth();
+      if (!u) u = (await fbAuth.signInAnonymously()).user;
+      uid = u.uid;
+      const meta = await room.child('meta').once('value');
+      if (!meta.exists() || (meta.val() && meta.val().open === false)) {
+        renderName('No encontramos la sala. Escanea otra vez el QR de la pantalla.'); return;
+      }
+    } catch (e) {
+      showBar('Sin conexión. Reintentando…'); setTimeout(connect, 3000); return;
+    }
+    joined = true;
+    pvRef = room.child('pv/' + uid);
+    pvRef.on('value', snap => { const m = snap.val(); if (m) onMsg(m); });
+    const presence = room.child('online/' + uid);
+    connRef = db.ref('.info/connected');
+    connRef.on('value', snap => {
+      if (kicked) return;
+      if (snap.val()) {
+        hideBar();
+        presence.onDisconnect().remove();
+        presence.set(true);
+        send({ t: 'join', name });
+      } else if (joined) showBar('Reconectando con la sala…');
     });
-    pr.on('error', err => { if (peer !== pr) return; fail(err.type === 'peer-unavailable' ? 'Buscando la sala…' : 'Problema de conexión.'); });
   }
 
   function onMsg(m) {
     if (!m || typeof m !== 'object') return;
     if (m.t === 'kicked') {
-      kicked = true; cleanup(); hideBar();
+      kicked = true; hideBar();
+      try { pvRef && pvRef.off(); connRef && connRef.off(); room.child('online/' + uid).remove(); } catch (e) {}
       page(el('div', { class: 'pcenter' }, el('h1', { text: 'Saliste de la sala' }), el('p', { text: 'La anfitriona te quitó de la partida.' })));
       return;
     }
-    if (m.t === 'img') {
-      imgs.set(m.id, m.data);
-      if (st && st.q && st.q.id === m.id && ['question', 'reveal'].includes(st.phase)) render(true);
-      return;
-    }
     if (m.t !== 'state') return;
-    fails = 0; hideBar();
+    hideBar();
     if (m.ev) { ev = m.ev; store.set('qdx-ev', ev); }
     const prevPhase = st && st.phase;
     st = m;
-    if (m.phase === 'question') { st.localEnd = Date.now() + m.remaining; st.elapsedNow = m.elapsed; }
+    if (!st.history) st.history = [];
+    if (m.phase === 'question') st.localEnd = Date.now() + m.remaining;
     if (m.phase === 'ready') st.localReady = Date.now() + m.readyIn;
     if (m.phase === 'reveal' && prevPhase !== 'reveal' && !m.q.poll && m.my === m.correct) { confetti(110, .5, .35); try { navigator.vibrate && navigator.vibrate([40, 40, 80]); } catch (e) {} }
     if (m.phase === 'podium' && prevPhase !== 'podium' && m.round.quiz && m.rank === 1) setTimeout(() => confetti(220, .5, .3), 300);
@@ -1958,10 +1760,10 @@ function Player() {
   }
 
   function answer(k) {
-    if (!st || st.phase !== 'question' || st.my != null || !conn || !conn.open) return;
+    if (!st || st.phase !== 'question' || st.my != null) return;
     if (st.localEnd - Date.now() <= 0) return;
     try { navigator.vibrate && navigator.vibrate(30); } catch (e) {}
-    st.my = k; conn.send({ t: 'answer', qi: st.qi, opt: k }); render();
+    st.my = k; send({ t: 'answer', qi: st.qi, opt: k }); render();
   }
 
   function render(force) {
@@ -1990,14 +1792,14 @@ function Player() {
       const left = Math.max(0, s.localReady - Date.now());
       page(head, el('div', { class: 'pcenter' }, el('div', { class: 'dicerow', style: { 'min-height': '120px' } }, dice(String(s.qi + 1), 90)),
         el('div', { class: 'eyebrow', text: `Pregunta ${s.qi + 1} de ${s.round.n}` }),
-        el('h1', { class: 'fadeup', style: { 'animation-delay': '1.2s', 'font-size': 'clamp(1.25rem,6.5cqw,1.8rem)' }, text: s.q.text }),
+        el('h1', { class: 'fadeup', style: { 'animation-delay': '1.2s' }, text: '¡Prepárate!' }),
         el('div', { class: 'readybar', style: { width: '100%' } }, el('i', { style: { '--d': left + 'ms' } })),
-        el('p', { text: '¡Prepárate!' })));
+        el('p', { text: '👀 Lee la pregunta en la pantalla principal' })));
       return;
     }
     if (s.phase === 'question') {
       const x = s.q;
-      if (s.my == null) { lastSec = 0; page(head, playerQuestionNodes(s, imgs.get(x.id), answer, false)); }
+      if (s.my == null) { lastSec = 0; pageQ(head, playerQuestionNodes(s, answer, false)); }
       else page(head, el('div', { class: 'pcenter' },
         el('h1', { text: x.poll ? '¡Voto enviado!' : '¡Respuesta enviada!' }),
         el('div', { class: 'chosen', style: { '--c': COLORS[x.slots[s.my]] } }, lt(x.slots[s.my]), el('span', { text: x.options[s.my] })),
@@ -2010,11 +1812,11 @@ function Player() {
       else if (s.my == null) box = el('div', { class: 'result neutral' }, el('h1', { text: '⏱ Se acabó el tiempo' }), el('p', { text: 'La correcta era: ' + x.options[x.correct] }));
       else if (s.my === s.correct) box = el('div', { class: 'result ok' }, el('h1', { text: '¡Correcto! 🎉' }), el('p', { text: '+' + fmt(s.gain) + ' puntos' }));
       else box = el('div', { class: 'result bad' }, el('h1', { text: 'Incorrecto' }), el('p', { text: 'La correcta era: ' + x.options[s.correct] }));
-      page(head, el('div', { class: 'pcenter' }, box, !x.poll && s.round.quiz ? el('p', { text: `Vas en el puesto ${s.rank} de ${s.count} en esta ronda` }) : null));
+      page(head, el('div', { class: 'pcenter' }, box, !x.poll && s.round.quiz ? el('p', { text: `Vas en el puesto ${s.rank} de ${s.count}` }) : null));
       return;
     }
     if (s.phase === 'board') {
-      page(head, el('div', { class: 'pcenter' }, el('p', { text: 'En ' + s.round.name + ' vas en el puesto' }), el('div', { class: 'bigrank', text: '#' + s.rank }),
+      page(head, el('div', { class: 'pcenter' }, el('p', { text: 'Vas en el puesto' }), el('div', { class: 'bigrank', text: '#' + s.rank }),
         el('p', { text: `de ${s.count} · ${fmt(s.score)} pts` })));
       return;
     }
